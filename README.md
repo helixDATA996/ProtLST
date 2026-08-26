@@ -174,7 +174,7 @@ The attribution workflow requires a deterministic manifest and frozen text
 embeddings. If no text teacher is available, train and infer the VAE alone as
 above. With a prepared manifest and Function text cache, run:
 
-### Build The Text Cache
+### Build The Text Cache and continue training
 
 Download a local Qwen3-Embedding model (or another Transformers encoder with a
 compatible hidden-state interface), then cache the three text views. The cache
