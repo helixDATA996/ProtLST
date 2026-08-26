@@ -53,6 +53,63 @@ Alternatively, install `requirements.txt` and run the scripts directly. The
 EvolutionaryScale ESM package must expose `esm.models.esmc.ESMC`. Depending on
 your CUDA setup, install the matching PyTorch build before other dependencies.
 
+## Download And Prepare UniProt Data
+
+The released code does not bundle protein data. The experiments used reviewed
+Swiss-Prot records from the UniProt 2024_01 release. For a current reviewed
+dataset, download the official UniProtKB JSON stream and save it locally:
+
+```bash
+mkdir -p data
+curl --fail --location --retry 3 \
+  --output data/uniprot_reviewed.json \
+  'https://rest.uniprot.org/uniprotkb/stream?query=reviewed%3Atrue&format=json'
+```
+
+The REST response is a JSON object containing a `results` array, not the
+training JSONL schema used by ProtLST. Convert it to JSONL with the following
+small script (the sequence and accession are required; annotations are
+optional):
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+src = json.loads(Path("data/uniprot_reviewed.json").read_text())
+with Path("data/uniprot.jsonl").open("w", encoding="utf-8") as out:
+    for item in src.get("results", []):
+        seq = item.get("sequence", {})
+        desc = item.get("proteinDescription", {})
+        comments = item.get("comments", [])
+        function = " ".join(
+            t.get("value", "")
+            for c in comments if c.get("commentType") == "FUNCTION"
+            for t in c.get("texts", []) if isinstance(t, dict)
+        )
+        go_terms = []
+        for ref in item.get("uniProtKBCrossReferences", []):
+            if ref.get("database") == "GO":
+                go_terms.append(ref.get("id"))
+        row = {
+            "accession": item.get("primaryAccession"),
+            "sequence": seq.get("value", ""),
+            "length": seq.get("length", len(seq.get("value", ""))),
+            "function_text": function,
+            "go_terms": sorted({x for x in go_terms if x}),
+            "ec_terms": [],
+        }
+        if row["accession"] and row["sequence"]:
+            out.write(json.dumps(row, ensure_ascii=False) + "\n")
+print("wrote data/uniprot.jsonl")
+PY
+```
+
+For strict reproduction, use a versioned local JSONL and a split TSV with
+columns `accession`, `split` (`train`, `validation`, or `test`), and optional
+family/group identifiers. Do not randomly split homologous proteins when
+measuring generalization.
+
 ## Train The Base VAE
 
 The input JSONL requires `accession`, `sequence`, and optional `go_terms`,
@@ -70,6 +127,15 @@ prot-lst-train \
   --out runs/trajectory_vae.pt
 ```
 
+The checkpoint contains the VAE weights and the ESM-C model name, but not ESM-C
+weights. The first run downloads ESM-C through the installed ESM package and
+requires a CUDA GPU for practical training. A small smoke run is:
+
+```bash
+prot-lst-train --data data/uniprot.jsonl --limit 32 --steps 5 \
+  --batch-size 2 --device cpu --out runs/smoke_vae.pt
+```
+
 ## Infer A Trajectory
 
 ```bash
@@ -81,10 +147,69 @@ prot-lst-infer \
 
 The output stores one CPU tensor per protein with shape `[L,4,256]`.
 
+For a FASTA file, use `--fasta` instead of `--sequence`:
+
+```bash
+prot-lst-infer --fasta data/example.fasta \
+  --checkpoint runs/trajectory_vae.pt \
+  --output runs/example_trajectories.pt \
+  --device cuda:0
+```
+
+Inspect the result:
+
+```bash
+python - <<'PY'
+import torch
+x = torch.load("runs/example_trajectories.pt", map_location="cpu")
+for row in x["records"]:
+    print(row["name"], tuple(row["trajectory"].shape))
+PY
+```
+
 ## Attribution Training
 
-Run `build_attribution_manifest.py`, then `build_esm_shards.py`, and finally
-`run_attribution_matrix.py`. The six supported arms are `esm`, `vae_z3`,
+The attribution workflow requires a deterministic manifest and frozen text
+embeddings. If no text teacher is available, train and infer the VAE alone as
+above. With a prepared manifest and Function text cache, run:
+
+```bash
+prot-lst-build-manifest \
+  --data data/uniprot.jsonl \
+  --split-file data/splits.tsv \
+  --text-cache runs/function_text_cache.pt \
+  --out runs/attribution_manifest.jsonl
+
+prot-lst-cache-esm \
+  --manifest runs/attribution_manifest.jsonl \
+  --out-dir runs/esm_shards \
+  --esm-model esmc_600m \
+  --shard-size 256 --batch-size 4 --device cuda:0
+```
+
+Then train one arm and evaluate it:
+
+```bash
+prot-lst-train-attribution \
+  --manifest runs/attribution_manifest.jsonl \
+  --shard-index runs/esm_shards/index.json \
+  --text-cache runs/function_text_cache.pt \
+  --vae runs/trajectory_vae.pt \
+  --arm joint_multitask \
+  --out runs/joint_multitask.seed17.pt \
+  --epochs 3 --batch-size 16 --model-dim 512 \
+  --layers 2 --heads 8 --device cuda:0
+
+prot-lst-evaluate \
+  --checkpoint runs/joint_multitask.seed17.pt \
+  --manifest runs/attribution_manifest.jsonl \
+  --shard-index runs/esm_shards/index.json \
+  --text-cache runs/function_text_cache.pt \
+  --split validation --out runs/joint_multitask.validation.json \
+  --device cuda:0
+```
+
+The six supported arms are `esm`, `vae_z3`,
 `z3_transformer`, `trajectory_frozen`, `joint_function`, and
 `joint_multitask`. Validation selects checkpoints; test evaluation should only
 be run after the configuration is locked.
