@@ -38,6 +38,7 @@ UniProt features are proxy labels, not experimental 3D structure labels.
 - `run_attribution_matrix.py`: multi-arm, multi-seed launcher.
 - `summarize_attribution_experiment.py`: aggregate report.
 - `infer_trajectory.py`: sequence/FASTA to `[L,4,256]` trajectory.
+- `cache_text_embeddings.py`: frozen Function/GO/EC text embedding cache.
 
 ## Installation
 
@@ -172,6 +173,31 @@ PY
 The attribution workflow requires a deterministic manifest and frozen text
 embeddings. If no text teacher is available, train and infer the VAE alone as
 above. With a prepared manifest and Function text cache, run:
+
+### Build The Text Cache
+
+Download a local Qwen3-Embedding model (or another Transformers encoder with a
+compatible hidden-state interface), then cache the three text views. The cache
+contains `views[Function, GO, EC]`, a `view_mask`, and GO labels; it does not
+contain protein embeddings.
+
+```bash
+prot-lst-cache-text \
+  --model /path/to/Qwen3-Embedding-0.6B \
+  --data data/uniprot.jsonl \
+  --split-file data/splits.tsv \
+  --split train \
+  --batch-size 8 \
+  --max-length 2048 \
+  --device cuda:0 \
+  --out runs/function_text_cache.train.pt
+```
+
+For validation and test, run the same command with `--split validation` and
+`--split test`, writing separate output files. The model is frozen during cache
+generation. The standalone script is included at
+`prot_lst/scripts/vae_trajectory/cache_text_embeddings.py`; its companion
+`prot_lst/text_embedding_models.py` is the only text-encoder dependency.
 
 ```bash
 prot-lst-build-manifest \
