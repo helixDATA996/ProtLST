@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prot-lst"
+version = "0.1.0"
+description = "Residue-preserving latent-stage trajectories for protein representation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.3",
+  "numpy>=1.24",
+  "scikit-learn>=1.3",
+  "tqdm>=4.66",
+  "esm>=3.0.0",
+]
+
+[project.scripts]
+prot-lst-train = "prot_lst.scripts.vae_trajectory.train_trajectory_vae:main"
+prot-lst-infer = "prot_lst.scripts.vae_trajectory.infer_trajectory:main"
+prot-lst-build-manifest = "prot_lst.scripts.vae_trajectory.build_attribution_manifest:main"
+prot-lst-cache-esm = "prot_lst.scripts.vae_trajectory.build_esm_shards:main"
+prot-lst-train-attribution = "prot_lst.scripts.vae_trajectory.train_attribution_experiment:main"
+prot-lst-evaluate = "prot_lst.scripts.vae_trajectory.evaluate_attribution_experiment:main"
+
+[tool.setuptools.packages.find]
+include = ["prot_lst*"]
