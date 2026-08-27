@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse, json, os, sys
 import torch
-ROOT=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); sys.path.insert(0,ROOT)
+ROOT=os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))); sys.path.insert(0,ROOT)
 from text_embedding_models import FrozenTextEncoder
 
 
