@@ -7,7 +7,7 @@ from torch.nn import functional as F
 
 ROOT=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); sys.path.insert(0,os.path.dirname(ROOT))
 from prot_lst.protein_vae_contrastive import ProteinVAEContrastiveTrajectory
-from prot_lst.scripts.vae_trajectory.train_attribution_experiment import AttentionProjection, ESMBaseline, InterleavedBridge, ShardStore, read_text_caches, text_vector, local_target, STRUCT, DOMAIN, make_batch, encode
+from prot_lst.scripts.vae_trajectory.train_attribution_experiment import AttentionProjection, DOMAIN_LABELS, ESMBaseline, InterleavedBridge, RESIDUE_LABELS, ShardStore, read_text_caches, text_vector, local_target, make_batch, encode
 
 
 def function_metrics(protein,text,hashes,permutation,source_ids=None):
@@ -32,6 +32,17 @@ def paired_bootstrap(projections, text, hashes, repeats, seed):
     point_permutation = torch.tensor(rng.permutation(len(text)), device=text.device)
     points = {name: function_metrics(projections[name], text, hashes, point_permutation) for name in names}
     base = "base"
+    if repeats <= 0:
+        result = {name: {metric: {"value": value, "ci95": None}
+                         for metric, value in metrics.items()}
+                  for name, metrics in points.items()}
+        for name in names:
+            if name != base:
+                result[name]["delta_vs_base"] = {
+                    metric: {"value": points[name][metric] - points[base][metric], "ci95": None}
+                    for metric in points[base]
+                }
+        return result
     samples = {name: {metric: [] for metric in points[base]} for name in names}
     deltas = {name: {metric: [] for metric in points[base]} for name in names if name != base}
     n = len(text)
@@ -66,6 +77,12 @@ def paired_bootstrap(projections, text, hashes, repeats, seed):
 
 def construct(ck,device):
     arm=ck["arm"]; a=ck["args"]; esm_dim=ck["esm_dim"]; latent=ck["latent_dim"]; text_dim=ck["text_dim"]
+    if arm not in {"esm", "vae_z3"} and ck.get("attention_mode") != "stage_causal":
+        raise ValueError("checkpoint predates the stage-causal z4 architecture; retrain the attribution model")
+    if arm != "vae_z3" and ck.get("local_head_type") != "multilabel":
+        raise ValueError("checkpoint predates the H1/H2 multilabel heads; retrain the attribution model")
+    if arm != "vae_z3" and (ck.get("residue_labels") != list(RESIDUE_LABELS) or ck.get("domain_labels") != list(DOMAIN_LABELS)):
+        raise ValueError("checkpoint uses a different H1/H2 feature taxonomy; retrain the attribution model")
     vae=None
     if arm=="esm":model=ESMBaseline(esm_dim,text_dim).to(device)
     else:
@@ -82,11 +99,35 @@ def shuffle_valid_residues(trajectory, mask):
     return shuffled
 
 
+def multilabel_metrics(target, scores, labels):
+    support = target.sum(0).astype(int)
+    positive_rate = target.mean(0)
+    per_hidden, macro, micro = {}, {}, {}
+    for hidden, score in scores.items():
+        per_label = {}
+        valid_values = []
+        for index, label in enumerate(labels):
+            if support[index] == 0:
+                per_label[label] = None
+                continue
+            value = float(average_precision_score(target[:, index], score[:, index]))
+            per_label[label] = value
+            valid_values.append(value)
+        per_hidden[hidden] = per_label
+        macro[hidden] = float(np.mean(valid_values)) if valid_values else None
+        micro[hidden] = float(average_precision_score(target.reshape(-1), score.reshape(-1)))
+    return {"labels": list(labels),
+            "support_by_label": {label: int(support[i]) for i, label in enumerate(labels)},
+            "positive_rate_by_label": {label: float(positive_rate[i]) for i, label in enumerate(labels)},
+            "macro_auprc_by_hidden": macro, "micro_auprc_by_hidden": micro,
+            "auprc_by_label_by_hidden": per_hidden}
+
+
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--checkpoint",required=True); ap.add_argument("--manifest",required=True); ap.add_argument("--shard-index",required=True); ap.add_argument("--text-cache",action="append",required=True); ap.add_argument("--split",choices=["validation","test"],default="validation"); ap.add_argument("--limit",type=int,default=512); ap.add_argument("--batch-size",type=int,default=4); ap.add_argument("--bootstrap",type=int,default=200); ap.add_argument("--seed",type=int,default=91); ap.add_argument("--device",default="cuda:0"); ap.add_argument("--out",required=True); a=ap.parse_args(); torch.manual_seed(a.seed); device=torch.device(a.device if torch.cuda.is_available() else "cpu"); ck=torch.load(a.checkpoint,map_location=device); arm,model,vae=construct(ck,device); store=ShardStore(a.shard_index); texts=read_text_caches(a.text_cache); rows=sorted([json.loads(x) for x in open(a.manifest) if json.loads(x)["split"]==a.split],key=lambda r:r["accession"]); rows=rows[:a.limit] if a.limit else rows
     modes=["base"]
     if arm in {"trajectory_frozen","joint_function","joint_multitask"}:modes += ["stage_shuffle","residue_shuffle","zero_z0","zero_z1","zero_z2","zero_z3","z3_only","zero"]
-    projections={m:[] for m in modes}; targets=[]; hashes=[]; structure_y=[]; domain_y=[]; structure_score={}; domain_score={}; structure_positive=domain_positive=structure_positions=domain_positions=0
+    projections={m:[] for m in modes}; targets=[]; hashes=[]; structure_y=[]; domain_y=[]; structure_score={}; domain_score={}; structure_positions=domain_positions=0
     with torch.no_grad():
       for start in range(0,len(rows),a.batch_size):
         batch=rows[start:start+a.batch_size]; emb,mask=make_batch(batch,store,ck["esm_dim"],device); base=encode(arm,model,vae,emb,mask); projections["base"].append(base["text"]); targets.append(torch.stack([text_vector(texts,r["accession"]) for r in batch]).to(device)); hashes.extend(r["function_hash"] for r in batch)
@@ -101,17 +142,17 @@ def main():
           for row_i,row in enumerate(batch):
             n=row["length"]
             if row["has_structure"]:
-              y=local_target(row,n,device,STRUCT); structure_y.append(y.cpu()); structure_positive+=int(y.sum()); structure_positions+=n
-              for stage,h in enumerate(hidden):structure_score.setdefault(f"h{stage}" if arm!="esm" else "esm",[]).append(torch.sigmoid(model.structure_head(h[row_i,:n]).squeeze(-1)).cpu())
+              y=local_target(row,n,device,RESIDUE_LABELS); structure_y.append(y.cpu()); structure_positions+=n
+              for stage,h in enumerate(hidden):structure_score.setdefault(f"h{stage}" if arm!="esm" else "esm",[]).append(torch.sigmoid(model.structure_head(h[row_i,:n])).cpu())
             if row["has_domain"]:
-              y=local_target(row,n,device,DOMAIN); domain_y.append(y.cpu()); domain_positive+=int(y.sum()); domain_positions+=n
-              for stage,h in enumerate(hidden):domain_score.setdefault(f"h{stage}" if arm!="esm" else "esm",[]).append(torch.sigmoid(model.domain_head(h[row_i,:n]).squeeze(-1)).cpu())
+              y=local_target(row,n,device,DOMAIN_LABELS); domain_y.append(y.cpu()); domain_positions+=n
+              for stage,h in enumerate(hidden):domain_score.setdefault(f"h{stage}" if arm!="esm" else "esm",[]).append(torch.sigmoid(model.domain_head(h[row_i,:n])).cpu())
     text=F.normalize(torch.cat(targets),dim=-1); result={"arm":arm,"split":a.split,"records":len(rows),"function":{},"local":{}}
     normalized={mode:F.normalize(torch.cat(values),dim=-1) for mode,values in projections.items()}
     result["function"]=paired_bootstrap(normalized,text,hashes,a.bootstrap,a.seed)
     if structure_y:
-      y=torch.cat(structure_y).numpy(); result["local"]["structure"]={"proteins":len(structure_y),"positions":structure_positions,"positive_rate":structure_positive/structure_positions,"auprc_by_hidden":{k:float(average_precision_score(y,torch.cat(v).numpy())) for k,v in structure_score.items()}}
+      y=torch.cat(structure_y).numpy(); scores={k:torch.cat(v).numpy() for k,v in structure_score.items()}; result["local"]["structure"]={"proteins":len(structure_y),"positions":structure_positions,**multilabel_metrics(y,scores,RESIDUE_LABELS)}
     if domain_y:
-      y=torch.cat(domain_y).numpy(); result["local"]["domain"]={"proteins":len(domain_y),"positions":domain_positions,"positive_rate":domain_positive/domain_positions,"auprc_by_hidden":{k:float(average_precision_score(y,torch.cat(v).numpy())) for k,v in domain_score.items()}}
+      y=torch.cat(domain_y).numpy(); scores={k:torch.cat(v).numpy() for k,v in domain_score.items()}; result["local"]["domain"]={"proteins":len(domain_y),"positions":domain_positions,**multilabel_metrics(y,scores,DOMAIN_LABELS)}
     Path(a.out).parent.mkdir(parents=True,exist_ok=True); json.dump(result,open(a.out,"w"),indent=2); print(json.dumps(result,indent=2))
 if __name__=="__main__":main()

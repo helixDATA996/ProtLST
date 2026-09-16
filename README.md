@@ -9,36 +9,58 @@ datasets, cached embeddings, model checkpoints, or Qwen weights.
 ## Architecture
 
 ```text
-ESM-C residues              [B,L,1152]
+ESM-C 300M residues         [B,L,960]
   -> Gaussian VAE posterior [B,L,256]
   -> z0/z1/z2/z3 trajectory [B,L,4,256]
-  -> interleaved Bridge     [B,L*4,512]
+  -> stage-causal Bridge    [B,L*4,256]
   -> H1 local proxy / H2 domain proxy / H3 Function alignment
+  -> z4 ESM reconstruction [B,L,960]
 ```
 
 `z1` uses a residual depthwise local convolution, `z2` uses a two-layer
 Transformer for long-range residue context, and `z3` applies a functional
 projection. No stage removes the residue axis. The Bridge projects each stage
-to 512 dimensions, adds residue and stage embeddings, and applies a two-layer
-PyTorch TransformerEncoder.
+to 256 dimensions in the current trained configuration, adds residue and stage
+embeddings, and applies a two-layer
+PyTorch TransformerEncoder. Bridge attention is causal over stages but global
+over residues: `Hk` may read all valid residues from `z0` through `zk`, never a
+future stage. During training the trajectory starts from a reparameterized VAE
+sample; inference and evaluation use the posterior mean.
+The trajectory VAE has no amino-acid sequence decoder; its decoder is the
+Bridge reconstruction head that maps H3 to the z4 ESM embedding estimate.
 
-The multitask loss combines balanced H1/H2 BCE, multi-positive Function
-InfoNCE, z3-to-ESM reconstruction, and residue-level KL regularization.
+The multitask loss combines balanced H1/H2 BCE, paired positive-only Function
+cosine alignment, H3-to-z4 ESM reconstruction, and residue-level KL
+regularization. Function training uses no in-batch or queued negatives.
+`z4` is a reconstruction output and is not an input stage of the Bridge.
 UniProt features are proxy labels, not experimental 3D structure labels.
+H1 is a fourteen-label residue-level sigmoid head (nine core labels, four
+expanded biological labels, plus `other`) and H2 is a fifteen-label
+domain/region sigmoid head (ten core labels, four expanded biological labels,
+plus `other`).
+Labels are independent, so overlapping annotations at one residue are preserved
+rather than collapsed into one target. The two `other` labels pool non-core
+UniProt point and interval annotations separately. `chain` is intentionally
+excluded because it is near-universal entry-boundary metadata rather than a
+discriminative biological feature. The canonical mapping lives in
+`feature_taxonomy.py`; `analyze_feature_types.py` reproduces the full local-data
+frequency report.
 
 ## Layout
 
 - `prot_lst/protein_vae.py`: residue-level Gaussian VAE.
 - `prot_lst/protein_vae_contrastive.py`: explicit z0/z1/z2/z3 states.
 - `prot_lst/scripts/vae_trajectory/train_trajectory_vae.py`: base VAE training.
-- `build_attribution_manifest.py`: deterministic split/label manifest.
+- `build_stage2_split.py`: duplicate-safe 45k/5k/5k split builder.
+- `build_attribution_manifest.py`: header-driven split/label manifest.
 - `build_esm_shards.py`: BF16 ESM-C residue cache.
 - `train_attribution_experiment.py`: six experimental arms.
 - `evaluate_attribution_experiment.py`: stage and shuffle evaluation.
 - `run_attribution_matrix.py`: multi-arm, multi-seed launcher.
 - `summarize_attribution_experiment.py`: aggregate report.
 - `infer_trajectory.py`: sequence/FASTA to `[L,4,256]` trajectory.
-- `cache_text_embeddings.py`: frozen Function/GO/EC text embedding cache.
+- `cache_text_embeddings.py`: frozen Function-only text embedding cache.
+- `run_stage2_joint_pipeline.py`: resumable 55k cache and four-epoch joint pipeline.
 
 ## Installation
 
@@ -123,11 +145,25 @@ prot-lst-train \
   --split train \
   --esm-model esmc_600m \
   --limit 50000 \
-  --steps 3000 \
+  --epochs 2 \
   --batch-size 8 \
   --out runs/trajectory_vae.pt
 ```
 
+Each epoch shuffles the selected records once and traverses them without
+replacement. `--steps` is only an optional total-step cap for smoke/debug runs.
+Interactive terminals display one `tqdm` batch progress bar per epoch with the
+current loss, reconstruction, cosine, KL, and learning rate. Redirected/background
+runs automatically keep only the periodic JSON log; pass `--no-progress` to
+disable the bar explicitly.
+Base VAE training uses an anti-collapse schedule by default: the first 2,000
+steps use the posterior mean, sampling noise and KL beta then ramp together over
+8,000 steps, and beta stops at 0.001. KL uses 0.01 free nats per latent
+dimension, while z4 reconstruction combines embedding MSE with a 0.01-weighted
+cosine loss. Checkpoint history records raw/effective KL, active latent units,
+posterior scale, noise scale, and cosine reconstruction so collapse remains
+observable. These values can be adjusted with `--deterministic-warmup-steps`,
+`--noise-ramp-steps`, `--beta-max`, `--kl-free-bits`, and `--cosine-weight`.
 The checkpoint contains the VAE weights and the ESM-C model name, but not ESM-C
 weights. The first run downloads ESM-C through the installed ESM package and
 requires a CUDA GPU for practical training. A small smoke run is:
@@ -177,27 +213,62 @@ above. With a prepared manifest and Function text cache, run:
 ### Build The Text Cache and continue training
 
 Download a local Qwen3-Embedding model (or another Transformers encoder with a
-compatible hidden-state interface), then cache the three text views. The cache
-contains `views[Function, GO, EC]`, a `view_mask`, and GO labels; it does not
-contain protein embeddings.
+compatible hidden-state interface), then cache the Function text view. The
+cache contains one normalized Function vector per protein; GO and EC are not
+training heads and are not injected into the protein encoder.
 
 ```bash
 prot-lst-cache-text \
   --model /path/to/Qwen3-Embedding-0.6B \
   --data data/uniprot.jsonl \
   --split-file data/splits.tsv \
-  --split train \
+  --split all \
   --batch-size 8 \
-  --max-length 2048 \
+  --max-length 512 \
   --device cuda:0 \
-  --out runs/function_text_cache.train.pt
+  --out runs/stage2_55k_function_text.pt
 ```
 
-For validation and test, run the same command with `--split validation` and
-`--split test`, writing separate output files. The model is frozen during cache
-generation. The standalone script is included at
+The model is frozen during cache generation. The standalone script is included at
 `prot_lst/scripts/vae_trajectory/cache_text_embeddings.py`; its companion
 `prot_lst/text_embedding_models.py` is the only text-encoder dependency.
+
+The locked second-stage experiment first creates a deterministic 45k training,
+5k validation, and 5k test split. Training records are selected from the first
+stage pool; held-out records come after that pool. Exact sequence and exact
+Function-text duplicates cannot cross splits. The TSV is parsed by header name,
+not column position:
+
+```bash
+prot-lst-build-stage2-split \
+  --data data/uniprot_reviewed.jsonl \
+  --out data/stage2_55k_splits.tsv \
+  --report data/stage2_55k_split_report.json
+```
+
+For the current ESM-C 300M/Qwen3 run, the complete resumable preparation and
+four-epoch training pipeline is:
+
+```bash
+prot-lst-stage2-pipeline \
+  --text-model C:/path/to/Qwen3-Embedding-0.6B \
+  --device cuda:0
+```
+
+It validates all artifact counts, caches one Function view for all 55k records,
+creates BF16 ESM-C 300M shards, and trains only `joint_multitask`. Every epoch
+visits all 45k training records once with a fresh shuffle and saves
+`joint_multitask_4ep.pt.epochN`. The main `joint_multitask_4ep.pt` is the best
+validation checkpoint. Epoch checkpoints contain optimizer, contrastive queue,
+and RNG state and can be resumed with `--resume`. The locked test split is
+cached but never evaluated by this pipeline.
+
+H1 and H2 supervision is confidence-masked independently: a protein with no
+annotation for that hierarchy contributes no BCE loss for that head. Within an
+annotated protein, unlabelled valid residues are negative positions. Class
+weights are fixed statistics from the same 45k supervised subset. Validation
+reports Function correlation and Top-1 retrieval plus per-class, Macro, and
+Micro AUPRC for H1/H2.
 
 ```bash
 prot-lst-build-manifest \

@@ -72,7 +72,8 @@ def main() -> None:
             output.append({"name": name, "sequence": sequence, "trajectory": states})
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"records": output, "shape_contract": "[L,4,256]", "checkpoint": str(args.checkpoint)}, args.output)
+    torch.save({"records": output, "shape_contract": "[L,4,256]", "trajectory_source": "posterior_mean",
+                "checkpoint": str(args.checkpoint)}, args.output)
     print(json.dumps({"completed": True, "records": len(output), "output": str(args.output),
                       "shapes": {item["name"]: list(item["trajectory"].shape) for item in output}}, indent=2))
 

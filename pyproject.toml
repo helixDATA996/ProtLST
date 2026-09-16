@@ -21,10 +21,16 @@ dependencies = [
 prot-lst-train = "prot_lst.scripts.vae_trajectory.train_trajectory_vae:main"
 prot-lst-infer = "prot_lst.scripts.vae_trajectory.infer_trajectory:main"
 prot-lst-build-manifest = "prot_lst.scripts.vae_trajectory.build_attribution_manifest:main"
+prot-lst-build-stage2-split = "prot_lst.scripts.vae_trajectory.build_stage2_split:main"
 prot-lst-cache-esm = "prot_lst.scripts.vae_trajectory.build_esm_shards:main"
 prot-lst-cache-text = "prot_lst.scripts.vae_trajectory.cache_text_embeddings:main"
 prot-lst-train-attribution = "prot_lst.scripts.vae_trajectory.train_attribution_experiment:main"
 prot-lst-evaluate = "prot_lst.scripts.vae_trajectory.evaluate_attribution_experiment:main"
+prot-lst-stage2-pipeline = "prot_lst.scripts.vae_trajectory.run_stage2_joint_pipeline:main"
+prot-lst-stage2-compare = "prot_lst.scripts.vae_trajectory.run_stage2_comparison:main"
+prot-lst-latent512-experiment = "prot_lst.scripts.vae_trajectory.run_latent512_experiment:main"
+prot-lst-positive-alignment-compare = "prot_lst.scripts.vae_trajectory.run_positive_alignment_comparison:main"
+prot-lst-calibrate-vicreg = "prot_lst.scripts.vae_trajectory.calibrate_function_vicreg:main"
 
 [tool.setuptools.packages.find]
 include = ["prot_lst*"]

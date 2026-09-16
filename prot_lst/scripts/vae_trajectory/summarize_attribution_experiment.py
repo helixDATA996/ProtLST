@@ -30,8 +30,24 @@ def main():
         for task in ("structure", "domain"):
             candidates = [x.get("local", {}).get(task) for x in items if x.get("local", {}).get(task)]
             if candidates:
-                keys = sorted(set().union(*(x.get("auprc_by_hidden", {}) for x in candidates)))
-                entry.setdefault("local", {})[task] = {"proteins": int(np.mean([x["proteins"] for x in candidates])), "positions": int(np.mean([x["positions"] for x in candidates])), "positive_rate": float(np.mean([x["positive_rate"] for x in candidates])), "auprc_by_hidden": {k: float(np.mean([x["auprc_by_hidden"][k] for x in candidates if k in x["auprc_by_hidden"]])) for k in keys}}
+                hidden_keys = sorted(set().union(*(x.get("macro_auprc_by_hidden", {}) for x in candidates)))
+                labels = candidates[0]["labels"]
+                per_label = {}
+                for hidden in hidden_keys:
+                    per_label[hidden] = {}
+                    for label in labels:
+                        values = [x.get("auprc_by_label_by_hidden", {}).get(hidden, {}).get(label) for x in candidates]
+                        values = [value for value in values if value is not None]
+                        per_label[hidden][label] = float(np.mean(values)) if values else None
+                entry.setdefault("local", {})[task] = {
+                    "proteins": int(np.mean([x["proteins"] for x in candidates])),
+                    "positions": int(np.mean([x["positions"] for x in candidates])),
+                    "labels": labels,
+                    "positive_rate_by_label": {label: float(np.mean([x["positive_rate_by_label"][label] for x in candidates])) for label in labels},
+                    "macro_auprc_by_hidden": {hidden: float(np.mean([x["macro_auprc_by_hidden"][hidden] for x in candidates if x["macro_auprc_by_hidden"].get(hidden) is not None])) for hidden in hidden_keys},
+                    "micro_auprc_by_hidden": {hidden: float(np.mean([x["micro_auprc_by_hidden"][hidden] for x in candidates])) for hidden in hidden_keys},
+                    "auprc_by_label_by_hidden": per_label,
+                }
         summary["experiments"][f"{arm}:{split}"] = entry
     for split in ("validation", "test"):
         multi = summary["experiments"].get(f"joint_multitask:{split}"); function = summary["experiments"].get(f"joint_function:{split}"); baselines = [summary["experiments"].get(f"{x}:{split}") for x in BASELINES]
@@ -41,9 +57,9 @@ def main():
         for mode in ("stage_shuffle", "zero_z1", "zero_z2"):
             records = multi.get("ablations", {}).get(mode, {}).get("delta_vs_base", []); drops = [-float(x["value"]) for x in records]; cis = [x["ci95"] for x in records]
             summary["decision"][split][f"{mode}_passes"] = bool(len(drops) == 3 and np.mean(drops) >= 0.10 * max(abs(mscore), 1e-8) and all(float(ci[1]) < 0 for ci in cis))
-        structure = multi.get("local", {}).get("structure", {}).get("auprc_by_hidden", {}); domain = multi.get("local", {}).get("domain", {}).get("auprc_by_hidden", {})
+        structure = multi.get("local", {}).get("structure", {}).get("macro_auprc_by_hidden", {}); domain = multi.get("local", {}).get("domain", {}).get("macro_auprc_by_hidden", {})
         esm = summary["experiments"].get(f"esm:{split}", {}).get("local", {})
-        esm_structure = esm.get("structure", {}).get("auprc_by_hidden", {}).get("esm", float("inf")); esm_domain = esm.get("domain", {}).get("auprc_by_hidden", {}).get("esm", float("inf"))
+        esm_structure = esm.get("structure", {}).get("macro_auprc_by_hidden", {}).get("esm", float("inf")); esm_domain = esm.get("domain", {}).get("macro_auprc_by_hidden", {}).get("esm", float("inf"))
         summary["decision"][split]["h1_structure_specific"] = bool(structure.get("h1", -1) == max(structure.values(), default=-2) and structure.get("h1", -1) > esm_structure)
         summary["decision"][split]["h2_domain_specific"] = bool(domain.get("h2", -1) == max(domain.values(), default=-2) and domain.get("h2", -1) > esm_domain)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True); json.dump(summary, open(a.out, "w", encoding="utf-8"), indent=2); print(json.dumps(summary, indent=2))

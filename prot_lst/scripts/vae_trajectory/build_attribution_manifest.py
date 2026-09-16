@@ -2,8 +2,10 @@ from __future__ import annotations
 import argparse, hashlib, json, os, random
 from pathlib import Path
 
-STRUCT = {"helix", "strand", "turn", "disulfide bond", "glycosylation site", "active site", "binding site", "modified residue", "short sequence motif"}
-DOMAIN = {"domain", "region of interest", "repeat", "zinc finger region", "dna-binding region", "coiled-coil region", "transmembrane region", "topological domain", "signal peptide", "transit peptide"}
+from prot_lst.scripts.vae_trajectory.feature_taxonomy import (
+    DOMAIN_SOURCE_TYPES, RESIDUE_SOURCE_TYPES, map_feature_type,
+)
+from prot_lst.scripts.vae_trajectory.split_io import read_split_file
 
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
@@ -14,12 +16,7 @@ def main() -> None:
     ap.add_argument("--text-cache", action="append", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--max-length", type=int, default=1024); ap.add_argument("--seed", type=int, default=20260823); ap.add_argument("--limit-per-split", type=int, default=0)
     a = ap.parse_args(); rng = random.Random(a.seed)
-    split = {}
-    with open(a.split_file, encoding="utf-8") as f:
-        next(f)
-        for line in f:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) >= 3: split[fields[0]] = fields[2]
+    split = read_split_file(a.split_file)
     cache = {}
     for path in a.text_cache: cache.update(__import__("torch").load(path, map_location="cpu")["cache"])
     rows = []
@@ -28,10 +25,10 @@ def main() -> None:
         item = cache.get(acc)
         if split.get(acc) not in {"train", "validation", "test"} or not (50 <= len(seq) <= a.max_length): continue
         if item is None or item.get("view_mask", [0])[0] <= 0: continue
-        struct_types = sorted({f.get("type", "").lower() for f in row.get("features", []) if f.get("type", "").lower() in STRUCT})
-        domain_types = sorted({f.get("type", "").lower() for f in row.get("features", []) if f.get("type", "").lower() in DOMAIN})
+        struct_types = sorted({mapped for f in row.get("features", []) if (mapped := map_feature_type(f.get("type", ""), "residue"))})
+        domain_types = sorted({mapped for f in row.get("features", []) if (mapped := map_feature_type(f.get("type", ""), "domain"))})
         function_text = row.get("function_text", "").strip()
-        relevant = [f for f in row.get("features", []) if f.get("type", "").lower() in STRUCT | DOMAIN]
+        relevant = [f for f in row.get("features", []) if f.get("type", "").lower() in RESIDUE_SOURCE_TYPES | DOMAIN_SOURCE_TYPES]
         rows.append({"accession": acc, "split": split[acc], "sequence": seq, "length": len(seq),
                      "function_hash": text_hash(function_text), "function_text": function_text,
                      "has_structure": bool(struct_types), "has_domain": bool(domain_types),
